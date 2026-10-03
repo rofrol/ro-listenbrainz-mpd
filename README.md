@@ -14,7 +14,8 @@
 > and submission cache stay in upstream's `listenbrainz-mpd` directories. Versions are upstream's plus
 > `-ro.N`. Install a release with
 > `cargo install --locked --git https://github.com/rofrol/ro-listenbrainz-mpd --tag v2.6.0-ro.4`,
-> or a checkout with `cargo install --locked --path .`. The rest of this README is upstream's.
+> or a checkout with `cargo install --locked --path .` (on Debian/Ubuntu first
+> `sudo apt install build-essential pkg-config libssl-dev libsqlite3-dev`). The rest of this README is upstream's.
 
 A [ListenBrainz](https://listenbrainz.org) submission client for [MPD](https://www.musicpd.org).
 
