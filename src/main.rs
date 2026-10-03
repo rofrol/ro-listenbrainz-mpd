@@ -1,6 +1,7 @@
 mod cache_actor;
 mod cli;
 mod config;
+mod skips;
 mod submission_actor;
 
 use std::{
@@ -304,6 +305,7 @@ async fn handle_state_change(
     let same_song = is_same_song(state.song.as_ref(), new_song.as_ref());
 
     if !same_song {
+        record_skip(state, new_song.is_some());
         start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
     } else if state.play_state == new_play_state
         && state.listen_submitted
@@ -373,6 +375,26 @@ fn handle_listen_complete(state: &mut State, http_actor: &SubmissionActor) {
         .as_secs();
 
     http_actor.listen(song.song, timestamp);
+}
+
+/// Fork: record the outgoing song as skipped if playback moved to another song
+/// before its end and it did not count as a listen. A stop is not a skip.
+fn record_skip(state: &State, changed_to_song: bool) {
+    let Some(old) = &state.song else { return };
+    if !changed_to_song || state.listen_submitted || state.play_state == PlayState::Stopped {
+        return;
+    }
+    let Some(duration) = old.song.duration else { return };
+    let position = state.last_position
+        + if state.play_state == PlayState::Playing {
+            state.last_seen.elapsed()
+        } else {
+            Duration::ZERO
+        };
+    if duration.saturating_sub(position) <= SEEK_TOLERANCE {
+        return; // played to the end
+    }
+    skips::record(&old.song, duration, position, position.saturating_sub(state.run_start));
 }
 
 /// Follow the playback position. A position away from where uninterrupted
