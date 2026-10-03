@@ -4,7 +4,6 @@ mod config;
 mod submission_actor;
 
 use std::{
-    cmp,
     net::SocketAddr,
     pin::Pin,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -37,10 +36,15 @@ use crate::{
     submission_actor::SubmissionActor,
 };
 
-/// The maximum time you have to listen to a song before it will count as a
-/// listen. Set to 4 minutes as per the recommendations in the ListenBrainz
-/// documentation.
-const MAX_REQUIRED_LISTEN_TIME: Duration = Duration::from_secs(4 * 60);
+/// Fraction of a song that has to be played without a seek or a stop (pauses
+/// don't matter) before it counts as a listen.
+const LISTEN_FRACTION: f64 = 0.9;
+
+/// How far the playback position may drift from where uninterrupted playback
+/// would put it before the change counts as a seek. MPD reports the position
+/// with millisecond precision; this only absorbs the latency between the idle
+/// notification and our status request.
+const SEEK_TOLERANCE: Duration = Duration::from_secs(2);
 
 /// Name of the client-to-client channel used to send ListenBrainz feedback
 /// commands.
@@ -151,16 +155,19 @@ struct State {
     play_state: PlayState,
     /// The current playing song, if any.
     song: Option<SongInQueue>,
-    /// The point in time at which the current listen segment was started. This
-    /// is used to calculate the real elapsed time when processing
-    /// pauses/unpauses.
-    listen_started: Instant,
+    /// Playback position where the current uninterrupted run started. A seek
+    /// or a stop starts a new run; a pause doesn't.
+    run_start: Duration,
+    /// Last observed playback position and when it was observed, used to tell
+    /// a seek from normal playback.
+    last_position: Duration,
+    last_seen: Instant,
     /// The system timestamp when the listen was started. This is used during
     /// submission to the ListenBrainz API.
     listen_timestamp: SystemTime,
-    /// The required remaining time the current song needs to play before it
-    /// will count as a listen.
-    listen_required: Duration,
+    /// How long the current song has to play in one run to count as a listen,
+    /// `None` if its duration is unknown (it is never submitted).
+    listen_required: Option<Duration>,
     /// The future that completes when the required duration is reached.
     listen_finished: Pin<Box<Sleep>>,
     /// `true` if a listen record for the current song has already been
@@ -172,7 +179,9 @@ struct State {
 
 impl State {
     fn should_poll(&self) -> bool {
-        self.play_state == PlayState::Playing && !self.listen_submitted
+        self.play_state == PlayState::Playing
+            && !self.listen_submitted
+            && self.listen_required.is_some()
     }
 }
 
@@ -194,13 +203,16 @@ async fn run(
     let mut state = State {
         play_state: status.state,
         song,
-        listen_started: Instant::now(),
+        run_start: Duration::ZERO,
+        last_position: Duration::ZERO,
+        last_seen: Instant::now(),
         listen_timestamp: SystemTime::now(),
         listen_required,
-        listen_finished: Box::pin(sleep(listen_required)),
+        listen_finished: Box::pin(sleep(Duration::ZERO)),
         listen_submitted: false,
         completed_listens: 0,
     };
+    track_position(&mut state, &status, true);
 
     #[cfg(feature = "systemd")]
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
@@ -286,39 +298,25 @@ async fn handle_state_change(
     let new_play_state = new_status.state;
     let same_song = is_same_song(state.song.as_ref(), new_song.as_ref());
 
-    if same_song && state.play_state == new_play_state {
+    if !same_song {
+        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+    } else if state.play_state == new_play_state
+        && state.listen_submitted
+        && is_same_track_on_repeat(&new_status)
+    {
         // Apply a heuristic to guess when a single track is being played on repeat.
-        if is_same_track_on_repeat(&new_status) && state.listen_submitted {
-            trace!("same track is being played on repeat");
-            start_new_listen(new_song.as_ref(), state, &new_play_state, http_actor);
-        } else {
-            // Nothing relevant changed. This happens when player options like shuffling are
-            // changed.
-            trace!("nothing changed");
-        }
-    } else if same_song {
-        if state.play_state != PlayState::Playing && new_play_state == PlayState::Playing {
-            // Resumed from pause, update the listen start time
-            trace!("resumed from pause or stop");
-            state.listen_started = Instant::now();
-            state.listen_finished = Box::pin(sleep(state.listen_required));
-        } else if state.play_state == PlayState::Playing && new_play_state == PlayState::Paused {
-            // Paused playing, subtract the elapsed time from the required listen
-            // duration
-            let played = state.listen_started.elapsed();
-            let remaining = state.listen_required.saturating_sub(played);
-            trace!(?played, ?remaining, "paused");
-            state.listen_required = remaining;
-        } else if state.play_state != PlayState::Stopped && new_play_state == PlayState::Stopped {
-            // Stopped playing entirely. If the playback starts again with the same
-            // song, count it as a new listen
+        trace!("same track is being played on repeat");
+        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+    } else {
+        // Same song: paused, resumed, stopped, seeked, or only player options changed
+        let stop_transition = (state.play_state == PlayState::Stopped)
+            != (new_play_state == PlayState::Stopped);
+        if stop_transition && new_play_state == PlayState::Stopped {
+            // If the playback starts again with the same song, count it as a new listen
             trace!("stopped");
             state.listen_submitted = false;
-            state.listen_required = required_time_for_song(new_song.as_ref());
         }
-    } else {
-        // The song changed
-        start_new_listen(new_song.as_ref(), state, &new_play_state, http_actor);
+        track_position(state, &new_status, stop_transition);
     }
 
     state.play_state = new_play_state;
@@ -330,6 +328,7 @@ async fn handle_state_change(
 /// Start the progress on a new listen and send a "Now playing" notification.
 fn start_new_listen(
     new_song: Option<&SongInQueue>,
+    new_status: &Status,
     state: &mut State,
     new_play_state: &PlayState,
     http_actor: SubmissionActor,
@@ -341,11 +340,9 @@ fn start_new_listen(
         "song changed"
     );
 
-    state.listen_started = Instant::now();
-    state.listen_timestamp = SystemTime::now();
     state.listen_required = required_playtime;
-    state.listen_finished = Box::pin(sleep(required_playtime));
     state.listen_submitted = false;
+    track_position(state, new_status, true);
 
     if let Some(song) = &new_song
         && *new_play_state == PlayState::Playing
@@ -371,6 +368,33 @@ fn handle_listen_complete(state: &mut State, http_actor: &SubmissionActor) {
         .as_secs();
 
     http_actor.listen(song.song, timestamp);
+}
+
+/// Follow the playback position. A position away from where uninterrupted
+/// playback would have put it is a seek and starts a new run, as does
+/// `new_run`; a pause keeps the run. Re-arms the listen timer for what the
+/// current run still needs. Call it before `state.play_state` is updated.
+fn track_position(state: &mut State, status: &Status, new_run: bool) {
+    let now = Instant::now();
+    let position = status.elapsed.unwrap_or_default();
+    let expected = if state.play_state == PlayState::Playing {
+        state.last_position + now.duration_since(state.last_seen)
+    } else {
+        state.last_position
+    };
+
+    if new_run || position.abs_diff(expected) > SEEK_TOLERANCE {
+        trace!(?position, ?expected, new_run, "starting a new uninterrupted run");
+        state.run_start = position;
+        state.listen_timestamp = SystemTime::now();
+    }
+    state.last_position = position;
+    state.last_seen = now;
+
+    if let Some(required) = state.listen_required {
+        let remaining = (state.run_start + required).saturating_sub(position);
+        state.listen_finished = Box::pin(sleep(remaining));
+    }
 }
 
 async fn handle_message_event(
@@ -514,21 +538,14 @@ async fn get_status_and_song(client: &Client) -> Result<(Status, Option<SongInQu
         .map_err(Into::into)
 }
 
-/// Calculate the required listen duration for the given song to count as a
-/// completed ListenBrainz listen.
-fn required_time_for_song(song: Option<&SongInQueue>) -> Duration {
-    if let Some(s) = song {
-        if let Some(song_duration) = s.song.duration {
-            // A song counts as listened if either half its duration or
-            // MAX_REQUIRED_LISTEN_TIME, whichever is lower, was listened to
-            cmp::min(song_duration / 2, MAX_REQUIRED_LISTEN_TIME)
-        } else {
-            warn!("song with unknown duration, assuming 4 minutes listen time");
-            MAX_REQUIRED_LISTEN_TIME
-        }
-    } else {
-        MAX_REQUIRED_LISTEN_TIME
+/// Calculate how long the given song has to play in one run to count as a
+/// completed ListenBrainz listen. `None` means it is never submitted.
+fn required_time_for_song(song: Option<&SongInQueue>) -> Option<Duration> {
+    let duration = song?.song.duration;
+    if duration.is_none() {
+        warn!("song with unknown duration, it will not be submitted");
     }
+    duration.map(|d| d.mul_f64(LISTEN_FRACTION))
 }
 
 fn song_url(s: Option<&Song>) -> &str {

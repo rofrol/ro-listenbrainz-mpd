@@ -1,5 +1,10 @@
 # `listenbrainz-mpd`
 
+> **Fork note (branch `contiguous-listen`):** a song counts as a listen only after 90% of it has
+> played in one uninterrupted run. Pauses don't break the run; a seek or a stop starts a new one.
+> Songs with unknown duration are never submitted. Upstream uses min(half the song, 4 minutes).
+> Install with `cargo install --locked --path .`.
+
 A [ListenBrainz](https://listenbrainz.org) submission client for [MPD](https://www.musicpd.org).
 
 ## Features
