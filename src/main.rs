@@ -4,7 +4,6 @@ mod config;
 mod submission_actor;
 
 use std::{
-    cmp,
     net::SocketAddr,
     pin::Pin,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -12,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::Configuration;
+use config::{Configuration, ListenRule};
 use mpd_client::{
     client::{Client, ConnectionEvent, ConnectionEvents, Subsystem},
     commands::{self, SingleMode},
@@ -37,10 +36,11 @@ use crate::{
     submission_actor::SubmissionActor,
 };
 
-/// The maximum time you have to listen to a song before it will count as a
-/// listen. Set to 4 minutes as per the recommendations in the ListenBrainz
-/// documentation.
-const MAX_REQUIRED_LISTEN_TIME: Duration = Duration::from_secs(4 * 60);
+/// How far the playback position may drift from where uninterrupted playback
+/// would put it before the change counts as a seek. MPD reports the position
+/// with millisecond precision; this only absorbs the latency between the idle
+/// notification and our status request.
+const SEEK_TOLERANCE: Duration = Duration::from_secs(2);
 
 /// Name of the client-to-client channel used to send ListenBrainz feedback
 /// commands.
@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
 
     let config = config::load(args.config).context("Failed to load configuration")?;
 
+    let listen_rule = config.listen_rule;
     let cache_actor = CacheActor::start(&config)?;
     let (mpd_client, state_changes) = connect(&config).await?;
     let (http_actor, http_actor_handle) = SubmissionActor::start(config, cache_actor);
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
         return send_feedback(mpd_client, feedback).await;
     }
 
-    let res = run(mpd_client, state_changes, http_actor).await;
+    let res = run(mpd_client, state_changes, http_actor, listen_rule).await;
 
     #[cfg(feature = "systemd")]
     {
@@ -151,16 +152,24 @@ struct State {
     play_state: PlayState,
     /// The current playing song, if any.
     song: Option<SongInQueue>,
-    /// The point in time at which the current listen segment was started. This
-    /// is used to calculate the real elapsed time when processing
-    /// pauses/unpauses.
-    listen_started: Instant,
+    /// When a played song counts as a listen.
+    rule: ListenRule,
+    /// Playback position where the current stretch of playback without a seek
+    /// started; a pause doesn't end it.
+    segment_start: Duration,
+    /// Playtime of the current listen before `segment_start`: always zero with
+    /// `rule.uninterrupted`, where a seek starts the count again.
+    played_before: Duration,
+    /// Last observed playback position and when it was observed, used to tell
+    /// a seek from normal playback.
+    last_position: Duration,
+    last_seen: Instant,
     /// The system timestamp when the listen was started. This is used during
     /// submission to the ListenBrainz API.
     listen_timestamp: SystemTime,
-    /// The required remaining time the current song needs to play before it
-    /// will count as a listen.
-    listen_required: Duration,
+    /// How long the current song has to play to count as a listen, `None` if it
+    /// never counts (unknown duration and no `rule.max`).
+    listen_required: Option<Duration>,
     /// The future that completes when the required duration is reached.
     listen_finished: Pin<Box<Sleep>>,
     /// `true` if a listen record for the current song has already been
@@ -172,7 +181,9 @@ struct State {
 
 impl State {
     fn should_poll(&self) -> bool {
-        self.play_state == PlayState::Playing && !self.listen_submitted
+        self.play_state == PlayState::Playing
+            && !self.listen_submitted
+            && self.listen_required.is_some()
     }
 }
 
@@ -180,11 +191,12 @@ async fn run(
     mpd_client: Client,
     mut connection_events: ConnectionEvents,
     http_actor: SubmissionActor,
+    rule: ListenRule,
 ) -> Result<()> {
     // Setup initial state
     let (status, song) = get_status_and_song(&mpd_client).await?;
 
-    let listen_required = required_time_for_song(song.as_ref());
+    let listen_required = required_time_for_song(song.as_ref(), rule);
 
     // Subscribe to the client-to-client channel used for feedback
     mpd_client
@@ -194,13 +206,18 @@ async fn run(
     let mut state = State {
         play_state: status.state,
         song,
-        listen_started: Instant::now(),
+        rule,
+        segment_start: Duration::ZERO,
+        played_before: Duration::ZERO,
+        last_position: Duration::ZERO,
+        last_seen: Instant::now(),
         listen_timestamp: SystemTime::now(),
         listen_required,
-        listen_finished: Box::pin(sleep(listen_required)),
+        listen_finished: Box::pin(sleep(Duration::ZERO)),
         listen_submitted: false,
         completed_listens: 0,
     };
+    track_position(&mut state, &status, true);
 
     #[cfg(feature = "systemd")]
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
@@ -286,39 +303,25 @@ async fn handle_state_change(
     let new_play_state = new_status.state;
     let same_song = is_same_song(state.song.as_ref(), new_song.as_ref());
 
-    if same_song && state.play_state == new_play_state {
+    if !same_song {
+        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+    } else if state.play_state == new_play_state
+        && state.listen_submitted
+        && is_same_track_on_repeat(&new_status)
+    {
         // Apply a heuristic to guess when a single track is being played on repeat.
-        if is_same_track_on_repeat(&new_status) && state.listen_submitted {
-            trace!("same track is being played on repeat");
-            start_new_listen(new_song.as_ref(), state, &new_play_state, http_actor);
-        } else {
-            // Nothing relevant changed. This happens when player options like shuffling are
-            // changed.
-            trace!("nothing changed");
-        }
-    } else if same_song {
-        if state.play_state != PlayState::Playing && new_play_state == PlayState::Playing {
-            // Resumed from pause, update the listen start time
-            trace!("resumed from pause or stop");
-            state.listen_started = Instant::now();
-            state.listen_finished = Box::pin(sleep(state.listen_required));
-        } else if state.play_state == PlayState::Playing && new_play_state == PlayState::Paused {
-            // Paused playing, subtract the elapsed time from the required listen
-            // duration
-            let played = state.listen_started.elapsed();
-            let remaining = state.listen_required.saturating_sub(played);
-            trace!(?played, ?remaining, "paused");
-            state.listen_required = remaining;
-        } else if state.play_state != PlayState::Stopped && new_play_state == PlayState::Stopped {
-            // Stopped playing entirely. If the playback starts again with the same
-            // song, count it as a new listen
+        trace!("same track is being played on repeat");
+        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+    } else {
+        // Same song: paused, resumed, stopped, seeked, or only player options changed
+        let stop_transition = (state.play_state == PlayState::Stopped)
+            != (new_play_state == PlayState::Stopped);
+        if stop_transition && new_play_state == PlayState::Stopped {
+            // If the playback starts again with the same song, count it as a new listen
             trace!("stopped");
             state.listen_submitted = false;
-            state.listen_required = required_time_for_song(new_song.as_ref());
         }
-    } else {
-        // The song changed
-        start_new_listen(new_song.as_ref(), state, &new_play_state, http_actor);
+        track_position(state, &new_status, stop_transition);
     }
 
     state.play_state = new_play_state;
@@ -330,22 +333,21 @@ async fn handle_state_change(
 /// Start the progress on a new listen and send a "Now playing" notification.
 fn start_new_listen(
     new_song: Option<&SongInQueue>,
+    new_status: &Status,
     state: &mut State,
     new_play_state: &PlayState,
     http_actor: SubmissionActor,
 ) {
-    let required_playtime = required_time_for_song(new_song);
+    let required_playtime = required_time_for_song(new_song, state.rule);
     debug!(
         song = song_url(new_song.map(|s| &s.song)),
         ?required_playtime,
         "song changed"
     );
 
-    state.listen_started = Instant::now();
-    state.listen_timestamp = SystemTime::now();
     state.listen_required = required_playtime;
-    state.listen_finished = Box::pin(sleep(required_playtime));
     state.listen_submitted = false;
+    track_position(state, new_status, true);
 
     if let Some(song) = &new_song
         && *new_play_state == PlayState::Playing
@@ -371,6 +373,45 @@ fn handle_listen_complete(state: &mut State, http_actor: &SubmissionActor) {
         .as_secs();
 
     http_actor.listen(song.song, timestamp);
+}
+
+/// Playtime of the current listen up to `position`.
+fn played(state: &State, position: Duration) -> Duration {
+    state.played_before + position.saturating_sub(state.segment_start)
+}
+
+/// Follow the playback position. A position away from where playback without a
+/// seek would have put it is a seek: with `rule.uninterrupted` it starts the
+/// count again, as does `new_listen`, otherwise the playtime so far is kept. A
+/// pause changes nothing. Re-arms the listen timer for the playtime still
+/// needed. Call it before `state.play_state` is updated.
+fn track_position(state: &mut State, status: &Status, new_listen: bool) {
+    let now = Instant::now();
+    let position = status.elapsed.unwrap_or_default();
+    let expected = if state.play_state == PlayState::Playing {
+        state.last_position + now.duration_since(state.last_seen)
+    } else {
+        state.last_position
+    };
+    let seek = position.abs_diff(expected) > SEEK_TOLERANCE;
+
+    if new_listen || (seek && state.rule.uninterrupted) {
+        trace!(?position, ?expected, new_listen, "counting playtime from zero");
+        state.played_before = Duration::ZERO;
+        state.segment_start = position;
+        state.listen_timestamp = SystemTime::now();
+    } else if seek {
+        trace!(?position, ?expected, "seek, keeping the playtime so far");
+        state.played_before = played(state, expected);
+        state.segment_start = position;
+    }
+    state.last_position = position;
+    state.last_seen = now;
+
+    if let Some(required) = state.listen_required {
+        let remaining = required.saturating_sub(played(state, position));
+        state.listen_finished = Box::pin(sleep(remaining));
+    }
 }
 
 async fn handle_message_event(
@@ -514,21 +555,16 @@ async fn get_status_and_song(client: &Client) -> Result<(Status, Option<SongInQu
         .map_err(Into::into)
 }
 
-/// Calculate the required listen duration for the given song to count as a
-/// completed ListenBrainz listen.
-fn required_time_for_song(song: Option<&SongInQueue>) -> Duration {
-    if let Some(s) = song {
-        if let Some(song_duration) = s.song.duration {
-            // A song counts as listened if either half its duration or
-            // MAX_REQUIRED_LISTEN_TIME, whichever is lower, was listened to
-            cmp::min(song_duration / 2, MAX_REQUIRED_LISTEN_TIME)
-        } else {
-            warn!("song with unknown duration, assuming 4 minutes listen time");
-            MAX_REQUIRED_LISTEN_TIME
-        }
-    } else {
-        MAX_REQUIRED_LISTEN_TIME
-    }
+/// Calculate how long the given song has to play to count as a completed
+/// ListenBrainz listen. `None` means it never counts.
+fn required_time_for_song(song: Option<&SongInQueue>, rule: ListenRule) -> Option<Duration> {
+    let song = song?;
+    let Some(duration) = song.song.duration else {
+        warn!(?rule.max, "song with unknown duration, using the maximum listen time");
+        return rule.max;
+    };
+    let needed = duration.mul_f64(rule.fraction);
+    Some(rule.max.map_or(needed, |max| needed.min(max)))
 }
 
 fn song_url(s: Option<&Song>) -> &str {
