@@ -1,6 +1,6 @@
 [package]
 name = "ro-listenbrainz-mpd"
-version = "2.6.0-ro.1"
+version = "2.6.0-ro.2"
 edition = "2024"
 description = "ListenBrainz submission client for MPD"
 license = "AGPL-3.0-only"
