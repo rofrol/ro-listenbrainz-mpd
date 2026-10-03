@@ -43,6 +43,18 @@ token = ""
 # If directory components of the path do not exist, they will be created.
 #cache_file = "/some/other/path/filename.db"
 
+# When a played song counts as a listen. By default half the song or 4 minutes, whichever is lower, as
+# recommended by the ListenBrainz documentation.
+#
+# Fraction of the song's duration that has to be played (greater than 0, at most 1).
+#listen_fraction = 0.5
+# Playtime in seconds that is always enough, whatever the fraction. Songs with an unknown duration count
+# after this time. 0 means no limit: only the fraction counts, and songs with an unknown duration never do.
+#listen_max_seconds = 240
+# Count only uninterrupted playback: a seek starts the count again, a pause does not. By default seeking
+# keeps the playtime so far.
+#listen_uninterrupted = false
+
 # This section configures how the application connects to your MPD server.
 #
 # The `MPD_HOST` and `MPD_PORT` environment variables will be preferred over the settings from

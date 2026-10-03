@@ -10,6 +10,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     num::NonZero,
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -40,6 +41,21 @@ pub struct Configuration {
     pub genre_separator: Option<char>,
     /// Path to the file used for caching listens
     pub cache_file: Option<PathBuf>,
+    /// When a played song counts as a listen
+    pub listen_rule: ListenRule,
+}
+
+/// When a played song counts as a listen.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenRule {
+    /// Fraction of the song's duration that has to be played
+    pub fraction: f64,
+    /// Playtime that is always enough, whatever the fraction; also used for songs
+    /// with an unknown duration (`None`: no limit, such songs never count)
+    pub max: Option<Duration>,
+    /// Count only uninterrupted playback: a seek starts the count again (a pause
+    /// does not)
+    pub uninterrupted: bool,
 }
 
 #[derive(Debug)]
@@ -255,6 +271,17 @@ pub fn load(path: Option<PathBuf>) -> Result<Configuration> {
         }
     };
 
+    let fraction = config.submission.listen_fraction;
+    if !(fraction > 0.0 && fraction <= 1.0) {
+        bail!("`submission.listen_fraction` must be greater than 0 and at most 1, not {fraction}");
+    }
+    let listen_rule = ListenRule {
+        fraction,
+        max: NonZero::new(config.submission.listen_max_seconds)
+            .map(|s| Duration::from_secs(s.get())),
+        uninterrupted: config.submission.listen_uninterrupted,
+    };
+
     Ok(Configuration {
         token,
         api_url,
@@ -264,6 +291,7 @@ pub fn load(path: Option<PathBuf>) -> Result<Configuration> {
         cache_file: config.submission.cache_file,
         submit_genres_as_folksonomy: config.submission.genres_as_folksonomy,
         genre_separator: config.submission.genre_separator,
+        listen_rule,
     })
 }
 
@@ -334,6 +362,9 @@ struct RawSubmissionConfig {
     genre_separator: Option<char>,
     enable_cache: bool,
     cache_file: Option<PathBuf>,
+    listen_fraction: f64,
+    listen_max_seconds: u64,
+    listen_uninterrupted: bool,
 }
 
 impl Default for RawSubmissionConfig {
@@ -346,6 +377,11 @@ impl Default for RawSubmissionConfig {
             genre_separator: None,
             enable_cache: true,
             cache_file: None,
+            // Half the song or 4 minutes, whichever is lower, as recommended by the
+            // ListenBrainz documentation
+            listen_fraction: 0.5,
+            listen_max_seconds: 4 * 60,
+            listen_uninterrupted: false,
         }
     }
 }

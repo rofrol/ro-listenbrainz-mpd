@@ -1,15 +1,18 @@
 # `listenbrainz-mpd`
 
 > **Fork note: this is `ro-listenbrainz-mpd`** (branch `contiguous-listen`), my fork of
-> [listenbrainz-mpd](https://codeberg.org/elomatreb/listenbrainz-mpd). A song counts as a listen only
-> after 90% of it has played in one uninterrupted run. Pauses don't break the run; a seek or a stop
-> starts a new one. Songs with unknown duration are never submitted. Upstream uses min(half the song,
-> 4 minutes).
+> [listenbrainz-mpd](https://codeberg.org/elomatreb/listenbrainz-mpd). It adds:
+>
+> - `listen_fraction`, `listen_max_seconds` and `listen_uninterrupted` in `[submission]` (see
+>   `config.toml.sample`); the defaults keep upstream's rule (half the song or 4 minutes). I use
+>   `0.9`, `0` and `true`: a listen is 90% of the song played without a seek; pauses don't matter.
+> - `skips.jsonl` next to the submission cache: songs left for another song before their end
+>   without counting as a listen (read by my musicdb; nothing is sent to ListenBrainz).
 >
 > The package and binary are `ro-listenbrainz-mpd`, so installing upstream never replaces it; config
 > and submission cache stay in upstream's `listenbrainz-mpd` directories. Versions are upstream's plus
 > `-ro.N`. Install a release with
-> `cargo install --locked --git https://github.com/rofrol/ro-listenbrainz-mpd --tag v2.6.0-ro.2`,
+> `cargo install --locked --git https://github.com/rofrol/ro-listenbrainz-mpd --tag v2.6.0-ro.3`,
 > or a checkout with `cargo install --locked --path .`. The rest of this README is upstream's.
 
 A [ListenBrainz](https://listenbrainz.org) submission client for [MPD](https://www.musicpd.org).
