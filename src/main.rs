@@ -1,7 +1,7 @@
 mod cache_actor;
 mod cli;
 mod config;
-mod skips;
+mod local_log;
 mod submission_actor;
 
 use std::{
@@ -379,6 +379,7 @@ fn handle_listen_complete(state: &mut State, http_actor: &SubmissionActor) {
         .unwrap()
         .as_secs();
 
+    local_log::record_listen(&song.song, timestamp);
     http_actor.listen(song.song, timestamp);
 }
 
@@ -399,7 +400,7 @@ fn record_skip(state: &State, changed_to_song: bool) {
     if duration.saturating_sub(position) <= SEEK_TOLERANCE {
         return; // played to the end
     }
-    skips::record(&old.song, duration, position, played(state, position));
+    local_log::record_skip(&old.song, duration, position, played(state, position));
 }
 
 /// Playtime of the current listen up to `position`.

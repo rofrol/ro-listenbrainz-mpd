@@ -6,13 +6,14 @@
 > - `listen_fraction`, `listen_max_seconds` and `listen_uninterrupted` in `[submission]` (see
 >   `config.toml.sample`); the defaults keep upstream's rule (half the song or 4 minutes). I use
 >   `0.9`, `0` and `true`: a listen is 90% of the song played without a seek; pauses don't matter.
-> - `skips.jsonl` next to the submission cache: songs left for another song before their end
->   without counting as a listen (read by my musicdb; nothing is sent to ListenBrainz).
+> - `listens.jsonl` and `skips.jsonl` next to the submission cache: every listen when it counts, and
+>   songs left for another song before their end without counting as a listen (read by musicdb in
+>   [rormpc-tools](https://github.com/rofrol/rormpc-tools); these logs are not sent anywhere).
 >
 > The package and binary are `ro-listenbrainz-mpd`, so installing upstream never replaces it; config
 > and submission cache stay in upstream's `listenbrainz-mpd` directories. Versions are upstream's plus
 > `-ro.N`. Install a release with
-> `cargo install --locked --git https://github.com/rofrol/ro-listenbrainz-mpd --tag v2.6.0-ro.3`,
+> `cargo install --locked --git https://github.com/rofrol/ro-listenbrainz-mpd --tag v2.6.0-ro.4`,
 > or a checkout with `cargo install --locked --path .`. The rest of this README is upstream's.
 
 A [ListenBrainz](https://listenbrainz.org) submission client for [MPD](https://www.musicpd.org).
