@@ -46,6 +46,11 @@ const LISTEN_FRACTION: f64 = 0.9;
 /// notification and our status request.
 const SEEK_TOLERANCE: Duration = Duration::from_secs(2);
 
+/// Directory name of the config and the submission cache. Kept as upstream's so
+/// the fork (package ro-listenbrainz-mpd) reads the same token and keeps
+/// pending listens across the rename.
+pub const STORAGE_DIR: &str = "listenbrainz-mpd";
+
 /// Name of the client-to-client channel used to send ListenBrainz feedback
 /// commands.
 const FEEDBACK_CHANNEL_NAME: &str = "listenbrainz_feedback";

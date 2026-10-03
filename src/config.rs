@@ -54,7 +54,8 @@ pub enum MpdAddress {
 
 fn default_path() -> PathBuf {
     let mut p = dirs::config_dir().expect("no config directory on this platform");
-    p.push(concat!(env!("CARGO_PKG_NAME"), "/config.toml"));
+    p.push(crate::STORAGE_DIR);
+    p.push("config.toml");
     p
 }
 

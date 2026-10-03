@@ -133,7 +133,7 @@ fn open_cache_file(config: &Configuration) -> Result<Connection> {
 /// Returns the default location of the submission cache.
 fn default_submission_cache_path() -> PathBuf {
     let mut p = dirs::data_local_dir().expect("No state/cache directory");
-    p.push(env!("CARGO_PKG_NAME"));
+    p.push(crate::STORAGE_DIR);
     p.push("submission-cache.sqlite3");
     p
 }

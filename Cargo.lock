@@ -677,28 +677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "listenbrainz-mpd"
-version = "2.6.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "clap_complete",
- "dirs",
- "mpd_client",
- "reqwest",
- "rusqlite",
- "sd-notify",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +961,28 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "ro-listenbrainz-mpd"
+version = "2.6.0-ro.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "clap_complete",
+ "dirs",
+ "mpd_client",
+ "reqwest",
+ "rusqlite",
+ "sd-notify",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
