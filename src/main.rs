@@ -414,8 +414,12 @@ fn played(state: &State, position: Duration) -> Duration {
 /// pause changes nothing. Re-arms the listen timer for the playtime still
 /// needed. Call it before `state.play_state` is updated.
 fn track_position(state: &mut State, status: &Status, new_listen: bool) {
-    let now = Instant::now();
     let position = status.elapsed.unwrap_or_default();
+    track_position_at(state, position, Instant::now(), new_listen);
+}
+
+/// `track_position` with the position MPD reported and the time it was seen.
+fn track_position_at(state: &mut State, position: Duration, now: Instant, new_listen: bool) {
     let expected = if state.play_state == PlayState::Playing {
         state.last_position + now.duration_since(state.last_seen)
     } else {
@@ -586,8 +590,13 @@ async fn get_status_and_song(client: &Client) -> Result<(Status, Option<SongInQu
 /// Calculate how long the given song has to play to count as a completed
 /// ListenBrainz listen. `None` means it never counts.
 fn required_time_for_song(song: Option<&SongInQueue>, rule: ListenRule) -> Option<Duration> {
-    let song = song?;
-    let Some(duration) = song.song.duration else {
+    required_time(song?.song.duration, rule)
+}
+
+/// How long a song of the given duration has to play to count, see
+/// `required_time_for_song`.
+fn required_time(duration: Option<Duration>, rule: ListenRule) -> Option<Duration> {
+    let Some(duration) = duration else {
         warn!(?rule.max, "song with unknown duration, using the maximum listen time");
         return rule.max;
     };
@@ -619,4 +628,159 @@ fn is_valid_mbid(mbid: &str) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RULE: ListenRule = ListenRule {
+        fraction: 0.5,
+        max: Some(Duration::from_secs(240)),
+        uninterrupted: false,
+    };
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn required_time_is_the_fraction_capped_by_the_max() {
+        assert_eq!(required_time(Some(s(200)), RULE), Some(s(100)));
+        assert_eq!(required_time(Some(s(600)), RULE), Some(s(240)));
+        assert_eq!(
+            required_time(None, RULE),
+            Some(s(240)),
+            "unknown duration: the max"
+        );
+        let no_max = ListenRule { max: None, ..RULE };
+        assert_eq!(required_time(Some(s(600)), no_max), Some(s(300)));
+        assert_eq!(
+            required_time(None, no_max),
+            None,
+            "unknown duration, no max: never counts"
+        );
+        let whole = ListenRule {
+            fraction: 1.0,
+            ..no_max
+        };
+        assert_eq!(required_time(Some(s(200)), whole), Some(s(200)));
+        assert_eq!(required_time_for_song(None, RULE), None);
+    }
+
+    /// A song that needs 100 s, started playing at position 0 at `t0`.
+    fn playing(rule: ListenRule, t0: Instant) -> State {
+        let mut state = State {
+            play_state: PlayState::Stopped,
+            song: None,
+            rule,
+            segment_start: Duration::ZERO,
+            played_before: Duration::ZERO,
+            last_position: Duration::ZERO,
+            last_seen: t0,
+            listen_timestamp: SystemTime::UNIX_EPOCH,
+            listen_required: Some(s(100)),
+            listen_finished: Box::pin(sleep(Duration::ZERO)),
+            listen_submitted: false,
+            completed_listens: 0,
+        };
+        see(&mut state, PlayState::Playing, 0, t0, true);
+        state
+    }
+
+    /// MPD reports `play_state` at `position` seconds, observed at `at`.
+    fn see(state: &mut State, play_state: PlayState, position: u64, at: Instant, new_listen: bool) {
+        track_position_at(state, s(position), at, new_listen);
+        state.play_state = play_state;
+    }
+
+    /// Time left until the listen counts, as the armed timer says.
+    fn remaining(state: &State) -> Duration {
+        state.listen_finished.deadline() - tokio::time::Instant::now()
+    }
+
+    fn close(a: Duration, b: Duration) -> bool {
+        a.abs_diff(b) < Duration::from_secs(1)
+    }
+
+    #[tokio::test]
+    async fn normal_playback_counts_toward_the_listen() {
+        let t0 = Instant::now();
+        let mut state = playing(RULE, t0);
+        assert!(close(remaining(&state), s(100)));
+        see(&mut state, PlayState::Playing, 31, t0 + s(30), false); // 1 s of latency: not a seek
+        assert_eq!(played(&state, s(31)), s(31));
+        assert!(close(remaining(&state), s(69)));
+    }
+
+    #[tokio::test]
+    async fn seek_keeps_the_playtime_by_default() {
+        let t0 = Instant::now();
+        let mut state = playing(RULE, t0);
+        let started = state.listen_timestamp;
+        see(&mut state, PlayState::Playing, 150, t0 + s(60), false);
+        assert_eq!(played(&state, s(150)), s(60));
+        assert!(close(remaining(&state), s(40)));
+        assert_eq!(state.listen_timestamp, started);
+        see(&mut state, PlayState::Playing, 170, t0 + s(80), false);
+        assert_eq!(played(&state, s(170)), s(80));
+    }
+
+    #[tokio::test]
+    async fn seek_restarts_the_count_when_uninterrupted() {
+        let t0 = Instant::now();
+        let mut state = playing(
+            ListenRule {
+                uninterrupted: true,
+                ..RULE
+            },
+            t0,
+        );
+        let started = state.listen_timestamp;
+        see(&mut state, PlayState::Playing, 10, t0 + s(60), false); // a seek back
+        assert_eq!(played(&state, s(10)), Duration::ZERO);
+        assert!(close(remaining(&state), s(100)));
+        assert!(
+            state.listen_timestamp > started,
+            "the listen starts at the seek"
+        );
+        see(&mut state, PlayState::Playing, 40, t0 + s(90), false);
+        assert_eq!(played(&state, s(40)), s(30));
+    }
+
+    #[tokio::test]
+    async fn pause_is_neutral_in_both_rules() {
+        for uninterrupted in [false, true] {
+            let t0 = Instant::now();
+            let mut state = playing(
+                ListenRule {
+                    uninterrupted,
+                    ..RULE
+                },
+                t0,
+            );
+            let started = state.listen_timestamp;
+            see(&mut state, PlayState::Paused, 60, t0 + s(60), false);
+            see(&mut state, PlayState::Playing, 60, t0 + s(600), false); // resumed ten minutes later
+            assert_eq!(
+                played(&state, s(60)),
+                s(60),
+                "uninterrupted: {uninterrupted}"
+            );
+            assert!(close(remaining(&state), s(40)));
+            assert_eq!(state.listen_timestamp, started);
+            see(&mut state, PlayState::Playing, 100, t0 + s(640), false);
+            assert_eq!(played(&state, s(100)), s(100));
+        }
+    }
+
+    #[tokio::test]
+    async fn new_listen_starts_from_zero_after_a_seek_kept_playtime() {
+        let t0 = Instant::now();
+        let mut state = playing(RULE, t0);
+        see(&mut state, PlayState::Playing, 150, t0 + s(60), false);
+        see(&mut state, PlayState::Playing, 0, t0 + s(70), true); // next song
+        assert_eq!(played(&state, s(0)), Duration::ZERO);
+        assert!(close(remaining(&state), s(100)));
+    }
 }

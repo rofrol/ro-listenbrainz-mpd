@@ -271,16 +271,11 @@ pub fn load(path: Option<PathBuf>) -> Result<Configuration> {
         }
     };
 
-    let fraction = config.submission.listen_fraction;
-    if !(fraction > 0.0 && fraction <= 1.0) {
-        bail!("`submission.listen_fraction` must be greater than 0 and at most 1, not {fraction}");
-    }
-    let listen_rule = ListenRule {
-        fraction,
-        max: NonZero::new(config.submission.listen_max_seconds)
-            .map(|s| Duration::from_secs(s.get())),
-        uninterrupted: config.submission.listen_uninterrupted,
-    };
+    let listen_rule = listen_rule(
+        config.submission.listen_fraction,
+        config.submission.listen_max_seconds,
+        config.submission.listen_uninterrupted,
+    )?;
 
     Ok(Configuration {
         token,
@@ -292,6 +287,17 @@ pub fn load(path: Option<PathBuf>) -> Result<Configuration> {
         submit_genres_as_folksonomy: config.submission.genres_as_folksonomy,
         genre_separator: config.submission.genre_separator,
         listen_rule,
+    })
+}
+
+fn listen_rule(fraction: f64, max_seconds: u64, uninterrupted: bool) -> Result<ListenRule> {
+    if !(fraction > 0.0 && fraction <= 1.0) {
+        bail!("`submission.listen_fraction` must be greater than 0 and at most 1, not {fraction}");
+    }
+    Ok(ListenRule {
+        fraction,
+        max: NonZero::new(max_seconds).map(|s| Duration::from_secs(s.get())),
+        uninterrupted,
     })
 }
 
@@ -404,5 +410,53 @@ fn env_var(name: &str) -> Result<Option<String>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(other) => Err(anyhow::Error::new(other)
             .context(format!("Failed to read environment variable {name}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(toml: &str) -> Result<ListenRule> {
+        let s = toml::from_str::<RawConfiguration>(toml).unwrap().submission;
+        listen_rule(
+            s.listen_fraction,
+            s.listen_max_seconds,
+            s.listen_uninterrupted,
+        )
+    }
+
+    #[test]
+    fn listen_rule_defaults_to_half_or_four_minutes() {
+        let r = rule("").unwrap();
+        assert_eq!(
+            (r.fraction, r.max, r.uninterrupted),
+            (0.5, Some(Duration::from_secs(240)), false)
+        );
+    }
+
+    #[test]
+    fn listen_rule_options_and_zero_max_means_no_limit() {
+        let r = rule(
+            "[submission]\nlisten_fraction = 0.8\nlisten_max_seconds = 0\nlisten_uninterrupted = true\n",
+        )
+        .unwrap();
+        assert_eq!((r.fraction, r.max, r.uninterrupted), (0.8, None, true));
+    }
+
+    #[test]
+    fn listen_fraction_must_be_in_zero_one() {
+        for bad in ["0", "-0.5", "1.5", "nan"] {
+            assert!(
+                rule(&format!("[submission]\nlisten_fraction = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            rule("[submission]\nlisten_fraction = 1.0\n")
+                .unwrap()
+                .fraction,
+            1.0
+        );
     }
 }
