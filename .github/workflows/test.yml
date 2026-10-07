@@ -1,0 +1,34 @@
+# The fork's own CI on GitHub; upstream's runs on Codeberg (.forgejo/workflows/ci.yml).
+name: Test
+
+on:
+  push:
+    branches: [contiguous-listen]
+    tags: ["v*-ro.*"]
+  pull_request:
+  workflow_dispatch:
+  # weekly, to catch toolchain and runner-image drift; GitHub disables schedules after 60 days without
+  # repository activity
+  schedule:
+    - cron: "37 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build dependencies (as in README.md)
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libsqlite3-dev
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
