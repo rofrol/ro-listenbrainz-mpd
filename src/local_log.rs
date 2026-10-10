@@ -47,9 +47,14 @@ fn append(path: &Path, line: &Value) {
     }
 }
 
-/// A listen that counts, with the time it started (the timestamp sent to ListenBrainz).
-pub fn record_listen(song: &Song, started: u64) {
-    let line = listen_line(&song.url, mbid(song), song.duration, started);
+/// A listen that counts, with the time it started (the timestamp sent to
+/// ListenBrainz); `manual` when it was sent on request (rormpc's "Send to
+/// ListenBrainz now") rather than by the listen rule.
+pub fn record_listen(song: &Song, started: u64, manual: bool) {
+    let mut line = listen_line(&song.url, mbid(song), song.duration, started);
+    if manual {
+        line["manual"] = Value::Bool(true);
+    }
     append(&path("listens.jsonl"), &line);
 }
 

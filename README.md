@@ -9,6 +9,16 @@
 > - `listens.jsonl` and `skips.jsonl` next to the submission cache: every listen when it counts, and
 >   songs left for another song before their end without counting as a listen (read by musicdb in
 >   [rormpc-tools](https://github.com/rofrol/rormpc-tools); these logs are not sent anywhere).
+> - `status.json` in the same directory: the current play's progress toward a listen as the daemon
+>   counts it (the rule, `required_s`, `counted_s` at `position_s`, `listen`: `counting`, `impossible`
+>   when too little of the song is left after a seek, `never` or `sent`), replaced atomically on each
+>   change, never on a timer; rormpc shows it as a countdown. A client adds MPD's elapsed time since
+>   `position_s` while playing.
+> - Manual send: the MPD channel message `submit <instance> <play>` on `listenbrainz_listen` (both values
+>   from `status.json`) sends the current play's listen now, once, with its start as the timestamp; the
+>   automatic listen of that play is then not sent, and `listens.jsonl` marks the line `"manual": true`.
+>   `status.json`'s `manual` field answers the request (`ok`, or why not: the song changed, already sent;
+>   `n` counts the answers).
 >
 > The package and binary are `ro-listenbrainz-mpd`, so installing upstream never replaces it; config
 > and submission cache stay in upstream's `listenbrainz-mpd` directories. Versions are upstream's plus

@@ -2,6 +2,7 @@ mod cache_actor;
 mod cli;
 mod config;
 mod local_log;
+mod status;
 mod submission_actor;
 
 use std::{
@@ -20,6 +21,7 @@ use mpd_client::{
     tag::Tag,
 };
 use serde::{Serialize, Serializer};
+use serde_json::{Value, json};
 #[cfg(unix)]
 use tokio::net::{UnixStream, unix::SocketAddr as UnixSocketAddr};
 use tokio::{
@@ -183,6 +185,15 @@ struct State {
     listen_submitted: bool,
     /// Counter for completed listens
     completed_listens: u64,
+    /// Fork: this daemon run (`<pid>-<start time>`) and the number of the
+    /// current play within it, one per listen started; a manual send names
+    /// both (see `status.rs`).
+    instance: String,
+    play: u64,
+    /// `true` if the current play's listen was sent by a manual request.
+    submitted_manually: bool,
+    /// The answer to the last manual send request, published in `status.json`.
+    manual_answer: Option<Value>,
 }
 
 impl State {
@@ -208,6 +219,9 @@ async fn run(
     mpd_client
         .command(commands::SubscribeToChannel(FEEDBACK_CHANNEL_NAME))
         .await?;
+    mpd_client
+        .command(commands::SubscribeToChannel(status::LISTEN_CHANNEL))
+        .await?;
 
     let mut state = State {
         play_state: status.state,
@@ -222,6 +236,17 @@ async fn run(
         listen_finished: Box::pin(sleep(Duration::ZERO)),
         listen_submitted: false,
         completed_listens: 0,
+        instance: format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ),
+        play: 0,
+        submitted_manually: false,
+        manual_answer: None,
     };
     track_position(&mut state, &status, true);
 
@@ -239,6 +264,7 @@ async fn run(
         );
         http_actor.now_playing(song.song.clone());
     }
+    publish(&state);
 
     debug!("entering main loop");
 
@@ -272,6 +298,7 @@ async fn run(
             }
             _ = &mut state.listen_finished, if state.should_poll() => {
                 handle_listen_complete(&mut state, &http_actor);
+                publish(&state);
             }
             _ = ctrl_c() => {
                 debug!("received interrupt");
@@ -333,6 +360,7 @@ async fn handle_state_change(
 
     state.play_state = new_play_state;
     state.song = new_song;
+    publish(state);
 
     Ok(())
 }
@@ -368,19 +396,124 @@ fn handle_listen_complete(state: &mut State, http_actor: &SubmissionActor) {
         song = song_url(state.song.as_ref().map(|s| &s.song)),
         "submitting listen entry"
     );
+    let (song, timestamp) = claim_listen(state, false).expect("no song to submit");
+    local_log::record_listen(&song, timestamp, false);
+    http_actor.listen(song, timestamp);
+}
+
+/// Mark the current play's listen as sent, once: the timer is disarmed and a
+/// second claim (the timer after a manual send, or the other way round) gets
+/// `None`. Returns the song and the listen's start, which is the timestamp sent
+/// for a manual listen too.
+fn claim_listen(state: &mut State, manual: bool) -> Option<(Song, u64)> {
+    if state.listen_submitted {
+        return None;
+    }
+    let song = state.song.clone()?.song;
     state.listen_submitted = true;
+    state.submitted_manually = manual;
     state.completed_listens += 1;
-
-    let song = state.song.clone().expect("no song to submit");
-
     let timestamp = state
         .listen_timestamp
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    Some((song, timestamp))
+}
 
-    local_log::record_listen(&song.song, timestamp);
-    http_actor.listen(song.song, timestamp);
+/// Fork: a `submit <instance> <play>` request. Claims the listen if the request
+/// names the current play and it was not sent yet; the answer goes to
+/// `state.manual_answer`.
+fn manual_submit(state: &mut State, message: &str) -> Option<(Song, u64)> {
+    let (outcome, play) = match status::parse_submit(message) {
+        None => (Err("invalid request"), None),
+        Some((instance, play)) if instance != state.instance || play != state.play => {
+            (Err("the song changed"), Some(play))
+        }
+        Some((_, play)) if state.song.is_none() || state.play_state == PlayState::Stopped => {
+            (Err("nothing is playing"), Some(play))
+        }
+        Some((_, play)) if state.listen_submitted => (Err("already sent"), Some(play)),
+        Some((_, play)) => (
+            claim_listen(state, true).ok_or("nothing is playing"),
+            Some(play),
+        ),
+    };
+    // `n` counts the answers, so a client tells its answer from an earlier one
+    // with the same content
+    let n = state
+        .manual_answer
+        .as_ref()
+        .and_then(|a| a["n"].as_u64())
+        .unwrap_or(0)
+        + 1;
+    state.manual_answer = Some(json!({
+        "n": n,
+        "play": play,
+        "ok": outcome.is_ok(),
+        "error": outcome.as_ref().err(),
+    }));
+    outcome.ok()
+}
+
+/// Fork: replace `status.json` with the current play's progress.
+fn publish(state: &State) {
+    status::write(&status_json(state));
+}
+
+/// Where the current play stands: `sent`, `never` (it cannot count: unknown
+/// duration and no maximum), `impossible` (not enough of the song is left to
+/// reach the required playtime from here, e.g. after a seek with the
+/// uninterrupted rule) or `counting`.
+fn listen_kind(state: &State) -> &'static str {
+    if state.listen_submitted {
+        return "sent";
+    }
+    let Some(required) = state.listen_required else {
+        return "never";
+    };
+    let duration = state.song.as_ref().and_then(|s| s.song.duration);
+    match duration {
+        Some(duration)
+            if state.played_before + duration.saturating_sub(state.segment_start) < required =>
+        {
+            "impossible"
+        }
+        _ => "counting",
+    }
+}
+
+/// `status.json`: see `status.rs`. `counted_s` is the playtime at `position_s`.
+fn status_json(state: &State) -> Value {
+    let song = state.song.as_ref();
+    let rule = state.rule;
+    json!({
+        "version": status::VERSION,
+        "pid": std::process::id(),
+        "instance": state.instance,
+        "play": state.play,
+        "id": song.map(|s| s.id.0),
+        "file": song.map(|s| &*s.song.url),
+        "duration_s": song.and_then(|s| s.song.duration).map(|d| d.as_secs_f64()),
+        "state": match state.play_state {
+            PlayState::Playing => "play",
+            PlayState::Paused => "pause",
+            PlayState::Stopped => "stop",
+        },
+        "rule": {
+            "fraction": rule.fraction,
+            "max_s": rule.max.map(|m| m.as_secs_f64()),
+            "uninterrupted": rule.uninterrupted,
+        },
+        "required_s": state.listen_required.map(|r| r.as_secs_f64()),
+        "segment_start_s": state.segment_start.as_secs_f64(),
+        "position_s": state.last_position.as_secs_f64(),
+        "counted_s": played(state, state.last_position).as_secs_f64(),
+        "listen": listen_kind(state),
+        "sent": state.listen_submitted.then_some(if state.submitted_manually { "manual" } else { "auto" }),
+        "manual": state.manual_answer,
+        "updated_at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+    })
 }
 
 /// Fork: record the outgoing song as skipped if playback moved to another song
@@ -427,6 +560,10 @@ fn track_position_at(state: &mut State, position: Duration, now: Instant, new_li
     };
     let seek = position.abs_diff(expected) > SEEK_TOLERANCE;
 
+    if new_listen {
+        state.play += 1;
+        state.submitted_manually = false;
+    }
     if new_listen || (seek && state.rule.uninterrupted) {
         trace!(?position, ?expected, new_listen, "counting playtime from zero");
         state.played_before = Duration::ZERO;
@@ -447,7 +584,7 @@ fn track_position_at(state: &mut State, position: Duration, now: Instant, new_li
 }
 
 async fn handle_message_event(
-    state: &State,
+    state: &mut State,
     mpd_client: &Client,
     http_actor: SubmissionActor,
 ) -> Result<()> {
@@ -457,10 +594,21 @@ async fn handle_message_event(
         .await
         .context("Failed to read messages")?;
 
-    let Some((_, message)) = messages
-        .into_iter()
-        .find(|(channel, _)| channel == FEEDBACK_CHANNEL_NAME)
-    else {
+    let mut feedback = None;
+    for (channel, message) in messages {
+        if channel == FEEDBACK_CHANNEL_NAME {
+            feedback.get_or_insert(message);
+        } else if channel == status::LISTEN_CHANNEL {
+            debug!(?message, "manual listen request received");
+            if let Some((song, timestamp)) = manual_submit(state, &message) {
+                info!(song = %song.url, "submitting listen entry on request");
+                local_log::record_listen(&song, timestamp, true);
+                http_actor.listen(song, timestamp);
+            }
+            publish(state);
+        }
+    }
+    let Some(message) = feedback else {
         debug!("no feedback message");
         return Ok(());
     };
@@ -683,9 +831,171 @@ mod tests {
             listen_finished: Box::pin(sleep(Duration::ZERO)),
             listen_submitted: false,
             completed_listens: 0,
+            instance: "1-2".to_owned(),
+            play: 0,
+            submitted_manually: false,
+            manual_answer: None,
         };
         see(&mut state, PlayState::Playing, 0, t0, true);
         state
+    }
+
+    /// A queued song as MPD's `currentsong` describes it: `mpd_client` builds
+    /// one only from a server response, so this answers it over an in-memory
+    /// connection.
+    async fn queued(url: &str, duration: u64) -> SongInQueue {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let url = url.to_owned();
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            write.write_all(b"OK MPD 0.24.0\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply = match line.as_str() {
+                    "idle" => continue, // answered by `noidle`
+                    "currentsong" => {
+                        format!("file: {url}\nduration: {duration}.000\nPos: 0\nId: 7\nOK\n")
+                    }
+                    _ => "OK\n".to_owned(),
+                };
+                write.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let (client, _events) = Client::connect(client_io).await.unwrap();
+        client
+            .command(commands::CurrentSong)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// `playing` with a 200 s song in the state, so a listen can be claimed.
+    async fn playing_song(rule: ListenRule, t0: Instant) -> State {
+        let mut state = playing(rule, t0);
+        state.song = Some(queued("a.mp3", 200).await);
+        state
+    }
+
+    const UNINTERRUPTED: ListenRule = ListenRule {
+        uninterrupted: true,
+        ..RULE
+    };
+
+    #[tokio::test]
+    async fn status_reports_the_rule_and_the_progress() {
+        let t0 = Instant::now();
+        let mut state = playing_song(RULE, t0).await;
+        see(&mut state, PlayState::Playing, 30, t0 + s(30), false);
+        let status = status_json(&state);
+        assert_eq!(status["listen"], "counting");
+        assert_eq!(status["required_s"], 100.0);
+        assert_eq!(status["counted_s"], 30.0);
+        assert_eq!(status["position_s"], 30.0);
+        assert_eq!(status["duration_s"], 200.0);
+        assert_eq!(status["id"], 7);
+        assert_eq!(status["state"], "play");
+        assert_eq!(status["rule"]["fraction"], 0.5);
+        assert_eq!(status["rule"]["max_s"], 240.0);
+        assert_eq!(status["sent"], Value::Null);
+        assert_eq!(status["play"], 1);
+    }
+
+    #[tokio::test]
+    async fn seek_late_with_the_uninterrupted_rule_makes_the_listen_impossible() {
+        let t0 = Instant::now();
+        let mut state = playing_song(UNINTERRUPTED, t0).await;
+        see(&mut state, PlayState::Playing, 99, t0 + s(5), false); // 101 s left: still enough
+        assert_eq!(listen_kind(&state), "counting");
+        see(&mut state, PlayState::Playing, 120, t0 + s(10), false); // 80 s left of 100 needed
+        assert_eq!(listen_kind(&state), "impossible");
+        assert_eq!(status_json(&state)["segment_start_s"], 120.0);
+        see(&mut state, PlayState::Playing, 0, t0 + s(20), false); // back to the start
+        assert_eq!(listen_kind(&state), "counting");
+        // the default rule keeps the playtime: 10 s played + 90 s left is
+        // enough
+        let mut state = playing_song(RULE, t0).await;
+        see(&mut state, PlayState::Playing, 110, t0 + s(10), false);
+        assert_eq!(listen_kind(&state), "counting");
+        see(&mut state, PlayState::Playing, 190, t0 + s(20), false);
+        assert_eq!(listen_kind(&state), "impossible");
+    }
+
+    #[tokio::test]
+    async fn unknown_duration_without_a_max_never_counts() {
+        let mut state = playing(ListenRule { max: None, ..RULE }, Instant::now());
+        state.listen_required = None;
+        assert_eq!(listen_kind(&state), "never");
+    }
+
+    #[tokio::test]
+    async fn manual_send_claims_the_listen_once() {
+        let t0 = Instant::now();
+        let mut state = playing_song(UNINTERRUPTED, t0).await;
+        see(&mut state, PlayState::Playing, 20, t0 + s(20), false);
+        let started = state
+            .listen_timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (song, timestamp) = manual_submit(&mut state, "submit 1-2 1").expect("sent");
+        assert_eq!(song.url, "a.mp3");
+        assert_eq!(timestamp, started, "listened_at is the listen's start");
+        assert_eq!(
+            state.manual_answer,
+            Some(json!({"n": 1, "play": 1, "ok": true, "error": null}))
+        );
+        let status = status_json(&state);
+        assert_eq!(
+            (status["listen"].as_str(), status["sent"].as_str()),
+            (Some("sent"), Some("manual"))
+        );
+        assert!(!state.should_poll(), "the timer is disarmed");
+        assert!(manual_submit(&mut state, "submit 1-2 1").is_none());
+        assert_eq!(
+            state.manual_answer.as_ref().unwrap()["error"],
+            "already sent"
+        );
+        assert_eq!(state.manual_answer.as_ref().unwrap()["n"], 2);
+        assert!(
+            claim_listen(&mut state, false).is_none(),
+            "no automatic listen after a manual one"
+        );
+        assert_eq!(state.completed_listens, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_send_for_another_play_is_refused() {
+        let t0 = Instant::now();
+        let mut state = playing_song(RULE, t0).await;
+        assert!(
+            manual_submit(&mut state, "submit 1-2 0").is_none(),
+            "an earlier play"
+        );
+        assert_eq!(
+            state.manual_answer.as_ref().unwrap()["error"],
+            "the song changed"
+        );
+        assert!(
+            manual_submit(&mut state, "submit 9-9 1").is_none(),
+            "another daemon run"
+        );
+        assert!(manual_submit(&mut state, "submit").is_none());
+        assert!(!state.listen_submitted);
+        see(&mut state, PlayState::Playing, 0, t0 + s(5), true); // the next song (or a repeat) starts
+        assert!(manual_submit(&mut state, "submit 1-2 1").is_none());
+        assert!(manual_submit(&mut state, "submit 1-2 2").is_some());
+    }
+
+    #[tokio::test]
+    async fn automatic_listen_is_not_sent_again_by_a_manual_request() {
+        let t0 = Instant::now();
+        let mut state = playing_song(RULE, t0).await;
+        assert!(claim_listen(&mut state, false).is_some());
+        assert_eq!(status_json(&state)["sent"], "auto");
+        assert!(manual_submit(&mut state, "submit 1-2 1").is_none());
+        assert_eq!(state.completed_listens, 1);
     }
 
     /// MPD reports `play_state` at `position` seconds, observed at `at`.
@@ -736,12 +1046,15 @@ mod tests {
             },
             t0,
         );
-        let started = state.listen_timestamp;
+        // a marker, not the clock: two readings of the system clock can be
+        // equal
+        state.listen_timestamp = SystemTime::UNIX_EPOCH;
         see(&mut state, PlayState::Playing, 10, t0 + s(60), false); // a seek back
         assert_eq!(played(&state, s(10)), Duration::ZERO);
         assert!(close(remaining(&state), s(100)));
-        assert!(
-            state.listen_timestamp > started,
+        assert_ne!(
+            state.listen_timestamp,
+            SystemTime::UNIX_EPOCH,
             "the listen starts at the seek"
         );
         see(&mut state, PlayState::Playing, 40, t0 + s(90), false);

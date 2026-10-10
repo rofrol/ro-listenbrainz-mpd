@@ -47,6 +47,9 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["io-util"] }
+
 [build-dependencies]
 clap = { version = "4.6.6", features = ["cargo", "derive"], optional = true }
 clap_complete = { version = "4.6.9", optional = true }
