@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "ro-listenbrainz-mpd"
-version = "2.6.0-ro.4"
+version = "2.6.0-ro.5"
 dependencies = [
  "anyhow",
  "bytes",
