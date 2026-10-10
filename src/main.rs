@@ -2,6 +2,7 @@ mod cache_actor;
 mod cli;
 mod config;
 mod local_log;
+mod sent_memory;
 mod status;
 mod submission_actor;
 
@@ -33,7 +34,7 @@ use tracing::{Instrument, debug, error, info, info_span, level_filters::LevelFil
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    cache_actor::CacheActor,
+    cache_actor::{CacheActor, SentMemory},
     cli::{CliArgs, Feedback},
     config::MpdAddress,
     submission_actor::SubmissionActor,
@@ -80,6 +81,7 @@ async fn main() -> Result<()> {
 
     let listen_rule = config.listen_rule;
     let cache_actor = CacheActor::start(&config)?;
+    let memory = cache_actor.sent_memory();
     let (mpd_client, state_changes) = connect(&config).await?;
     let (http_actor, http_actor_handle) = SubmissionActor::start(config, cache_actor);
 
@@ -87,7 +89,8 @@ async fn main() -> Result<()> {
         return send_feedback(mpd_client, feedback).await;
     }
 
-    let res = run(mpd_client, state_changes, http_actor, listen_rule).await;
+    // `run` drops `memory` before the actors exit: the cache actor waits for it
+    let res = run(mpd_client, state_changes, http_actor, listen_rule, memory).await;
 
     #[cfg(feature = "systemd")]
     {
@@ -194,6 +197,8 @@ struct State {
     submitted_manually: bool,
     /// The answer to the last manual send request, published in `status.json`.
     manual_answer: Option<Value>,
+    /// Fork: where a sent play is remembered across a restart.
+    memory: SentMemory,
 }
 
 impl State {
@@ -209,6 +214,7 @@ async fn run(
     mut connection_events: ConnectionEvents,
     http_actor: SubmissionActor,
     rule: ListenRule,
+    memory: SentMemory,
 ) -> Result<()> {
     // Setup initial state
     let (status, song) = get_status_and_song(&mpd_client).await?;
@@ -247,8 +253,12 @@ async fn run(
         play: 0,
         submitted_manually: false,
         manual_answer: None,
+        memory,
     };
     track_position(&mut state, &status, true);
+    // a restart in the middle of a play whose listen was already sent
+    let last_sent = state.memory.last().await;
+    restore_sent(&mut state, last_sent, unix_now());
 
     #[cfg(feature = "systemd")]
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
@@ -338,18 +348,30 @@ async fn handle_state_change(
 
     if !same_song {
         record_skip(state, new_song.is_some());
-        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+        start_new_listen(
+            new_song.as_ref(),
+            &new_status,
+            state,
+            &new_play_state,
+            http_actor,
+        );
     } else if state.play_state == new_play_state
         && state.listen_submitted
         && is_same_track_on_repeat(&new_status)
     {
         // Apply a heuristic to guess when a single track is being played on repeat.
         trace!("same track is being played on repeat");
-        start_new_listen(new_song.as_ref(), &new_status, state, &new_play_state, http_actor);
+        start_new_listen(
+            new_song.as_ref(),
+            &new_status,
+            state,
+            &new_play_state,
+            http_actor,
+        );
     } else {
         // Same song: paused, resumed, stopped, seeked, or only player options changed
-        let stop_transition = (state.play_state == PlayState::Stopped)
-            != (new_play_state == PlayState::Stopped);
+        let stop_transition =
+            (state.play_state == PlayState::Stopped) != (new_play_state == PlayState::Stopped);
         if stop_transition && new_play_state == PlayState::Stopped {
             // If the playback starts again with the same song, count it as a new listen
             trace!("stopped");
@@ -456,9 +478,67 @@ fn manual_submit(state: &mut State, message: &str) -> Option<(Song, u64)> {
     outcome.ok()
 }
 
-/// Fork: replace `status.json` with the current play's progress.
+/// Fork: replace `status.json` with the current play's progress, and remember
+/// the play if its listen was sent.
 fn publish(state: &State) {
     status::write(&status_json(state));
+    if let Some(sent) = sent_play(state, unix_now()) {
+        state.memory.remember(sent);
+    }
+}
+
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// The current play as `sent_memory` keeps it, if its listen was sent; `now`
+/// is the Unix time now.
+fn sent_play(state: &State, now: f64) -> Option<sent_memory::SentPlay> {
+    if !state.listen_submitted {
+        return None;
+    }
+    let song = state.song.as_ref()?;
+    Some(sent_memory::SentPlay {
+        instance: state.instance.clone(),
+        play: state.play,
+        song_id: song.id.0,
+        file: song.song.url.clone(),
+        duration: song.song.duration,
+        listened_at: state
+            .listen_timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        manual: state.submitted_manually,
+        position: state.last_position,
+        playing: state.play_state == PlayState::Playing,
+        seen_at: now - state.last_seen.elapsed().as_secs_f64(),
+    })
+}
+
+/// Fork: at startup, mark the current play as sent if it continues the last
+/// sent play (see `sent_memory::is_same_play`), so its automatic listen is not
+/// sent again. `now` is the Unix time now.
+fn restore_sent(state: &mut State, sent: Option<sent_memory::SentPlay>, now: f64) {
+    let Some(sent) = sent else { return };
+    let Some(song) = &state.song else { return };
+    if !sent_memory::is_same_play(
+        &sent,
+        song.id.0,
+        &song.song.url,
+        state.play_state,
+        state.last_position,
+        now,
+    ) {
+        return;
+    }
+    info!(song = %sent.file, manual = sent.manual, "listen already sent before a restart");
+    state.listen_submitted = true;
+    state.submitted_manually = sent.manual;
+    state.listen_timestamp = UNIX_EPOCH + Duration::from_secs(sent.listened_at);
 }
 
 /// Where the current play stands: `sent`, `never` (it cannot count: unknown
@@ -523,7 +603,9 @@ fn record_skip(state: &State, changed_to_song: bool) {
     if !changed_to_song || state.listen_submitted || state.play_state == PlayState::Stopped {
         return;
     }
-    let Some(duration) = old.song.duration else { return };
+    let Some(duration) = old.song.duration else {
+        return;
+    };
     let position = state.last_position
         + if state.play_state == PlayState::Playing {
             state.last_seen.elapsed()
@@ -565,7 +647,12 @@ fn track_position_at(state: &mut State, position: Duration, now: Instant, new_li
         state.submitted_manually = false;
     }
     if new_listen || (seek && state.rule.uninterrupted) {
-        trace!(?position, ?expected, new_listen, "counting playtime from zero");
+        trace!(
+            ?position,
+            ?expected,
+            new_listen,
+            "counting playtime from zero"
+        );
         state.played_before = Duration::ZERO;
         state.segment_start = position;
         state.listen_timestamp = SystemTime::now();
@@ -835,6 +922,7 @@ mod tests {
             play: 0,
             submitted_manually: false,
             manual_answer: None,
+            memory: SentMemory::default(),
         };
         see(&mut state, PlayState::Playing, 0, t0, true);
         state
@@ -996,6 +1084,82 @@ mod tests {
         assert_eq!(status_json(&state)["sent"], "auto");
         assert!(manual_submit(&mut state, "submit 1-2 1").is_none());
         assert_eq!(state.completed_listens, 1);
+    }
+
+    /// The play's row after a trip through the database, as a restarted daemon
+    /// reads it; observed at Unix time 1000.
+    fn remembered(state: &State) -> sent_memory::SentPlay {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute(sent_memory::SCHEMA, ()).unwrap();
+        sent_memory::store(&db, &sent_play(state, 1000.0).expect("sent")).unwrap();
+        sent_memory::last(&db).unwrap().unwrap()
+    }
+
+    /// A 200 s song played to 120 s, its listen sent manually or automatically.
+    async fn sent_at_120(manual: bool) -> State {
+        let t0 = Instant::now();
+        let mut state = playing_song(RULE, t0).await;
+        see(&mut state, PlayState::Playing, 120, t0 + s(120), false);
+        if manual {
+            assert!(manual_submit(&mut state, "submit 1-2 1").is_some());
+        } else {
+            assert!(claim_listen(&mut state, false).is_some());
+        }
+        state
+    }
+
+    /// A new daemon run that finds the same queue entry playing at `position`
+    /// at Unix time `now` and reads `sent` from the database.
+    async fn restarted(sent: sent_memory::SentPlay, position: u64, now: f64) -> State {
+        let t0 = Instant::now();
+        let mut state = playing_song(RULE, t0).await;
+        state.instance = "3-4".to_owned();
+        state.play = 0;
+        see(&mut state, PlayState::Playing, position, t0, true);
+        restore_sent(&mut state, Some(sent), now);
+        state
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_an_automatic_send_does_not_send_again() {
+        let before = sent_at_120(false).await;
+        let state = &mut restarted(remembered(&before), 125, 1005.0).await;
+        let status = status_json(state);
+        assert_eq!(
+            (status["listen"].as_str(), status["sent"].as_str()),
+            (Some("sent"), Some("auto"))
+        );
+        assert!(!state.should_poll(), "the timer is disarmed");
+        assert!(claim_listen(state, false).is_none());
+        let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(
+            secs(state.listen_timestamp),
+            secs(before.listen_timestamp),
+            "the play keeps its listen's start"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_a_manual_send_does_not_send_again() {
+        let before = sent_at_120(true).await;
+        let state = &mut restarted(remembered(&before), 125, 1005.0).await;
+        assert_eq!(status_json(state)["sent"], "manual");
+        assert!(claim_listen(state, false).is_none(), "no automatic listen");
+        assert!(manual_submit(state, "submit 3-4 1").is_none());
+        assert_eq!(
+            state.manual_answer.as_ref().unwrap()["error"],
+            "already sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_after_a_restart_still_counts() {
+        let before = sent_at_120(false).await;
+        // 80 s to the end and 10 s of the replay since the send
+        let state = &mut restarted(remembered(&before), 10, 1090.0).await;
+        assert_eq!(listen_kind(state), "counting");
+        assert!(state.should_poll());
+        assert!(claim_listen(state, false).is_some());
     }
 
     /// MPD reports `play_state` at `position` seconds, observed at `at`.

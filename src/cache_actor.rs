@@ -15,7 +15,10 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::config::Configuration;
+use crate::{
+    config::Configuration,
+    sent_memory::{self, SentPlay},
+};
 
 const DB_SCHEMA: &str = "create table if not exists pending_submissions
 (
@@ -39,6 +42,12 @@ impl CacheActor {
         let handle = thread::spawn(move || run(rx, db));
 
         Ok(CacheActor(Some((tx, handle))))
+    }
+
+    /// A handle that remembers sent plays in this database; it does nothing
+    /// when the cache is disabled. Drop it before `shutdown`.
+    pub fn sent_memory(&self) -> SentMemory {
+        SentMemory(self.0.as_ref().map(|(tx, _)| tx.clone()))
     }
 
     pub fn shutdown(self) {
@@ -67,6 +76,25 @@ impl CacheActor {
             .expect("Cache actor is gone");
 
         responder_rx.await.expect("Cache actor did not respond")
+    }
+}
+
+/// Fork: see `sent_memory.rs`.
+#[derive(Debug, Clone, Default)]
+pub struct SentMemory(Option<UnboundedSender<CacheAction>>);
+
+impl SentMemory {
+    pub fn remember(&self, sent: SentPlay) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(CacheAction::RememberSent(sent));
+        }
+    }
+
+    pub async fn last(&self) -> Option<SentPlay> {
+        let tx = self.0.as_ref()?;
+        let (responder_tx, responder_rx) = oneshot::channel();
+        tx.send(CacheAction::LastSent(responder_tx)).ok()?;
+        responder_rx.await.ok()?
     }
 }
 
@@ -150,6 +178,8 @@ fn run(mut receiver: UnboundedReceiver<CacheAction>, mut db: Connection) {
 
     db.execute(DB_SCHEMA, ())
         .expect("Failed to initialize database");
+    db.execute(sent_memory::SCHEMA, ())
+        .expect("Failed to initialize database");
 
     while let Some(action) = receiver.blocking_recv() {
         match action {
@@ -166,6 +196,18 @@ fn run(mut receiver: UnboundedReceiver<CacheAction>, mut db: Connection) {
                     cache_submissions(&mut db, &pending)
                         .expect("Failed to re-insert pending submissions");
                 }
+            }
+            CacheAction::RememberSent(sent) => {
+                if let Err(error) = sent_memory::store(&db, &sent) {
+                    warn!(?error, "cannot remember the sent listen");
+                }
+            }
+            CacheAction::LastSent(responder) => {
+                let last = sent_memory::last(&db).unwrap_or_else(|error| {
+                    warn!(?error, "cannot read the last sent listen");
+                    None
+                });
+                let _ = responder.send(last);
             }
         }
     }
@@ -221,4 +263,6 @@ fn load_pending_submissions(db: &mut Connection) -> Result<Vec<Box<RawValue>>> {
 enum CacheAction {
     CacheFailedSubmissions(Vec<Box<RawValue>>),
     GetCachedSubmissions(oneshot::Sender<Vec<Box<RawValue>>>),
+    RememberSent(SentPlay),
+    LastSent(oneshot::Sender<Option<SentPlay>>),
 }

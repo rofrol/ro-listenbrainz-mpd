@@ -19,6 +19,18 @@
 >   automatic listen of that play is then not sent, and `listens.jsonl` marks the line `"manual": true`.
 >   `status.json`'s `manual` field answers the request (`ok`, or why not: the song changed, already sent;
 >   `n` counts the answers).
+> - A sent listen survives a restart: the play whose listen was sent (manually or automatically) is
+>   kept in the submission cache's database (table `sent_listens`, rows older than a day are deleted;
+>   nothing is kept with `enable_cache = false`), so a daemon restarted in the middle of that song
+>   neither sends it again nor accepts a manual send, and `status.json` shows it `sent`. After the
+>   restart it is the same play if MPD's song id and file match, playback is not stopped, and too
+>   little time has passed for the rest of the song plus the current position to have played since
+>   the last observation (or a paused song is still where it was). A replay of the song, on repeat
+>   or with the queue played round, counts again. Left open, since MPD only shows the state at the
+>   restart: a pause longer than the song while the daemon was down, followed by playback, looks
+>   like a replay and can send the listen again (so can a song of unknown duration); a stop and a
+>   new start of the same song within the downtime, which counts as a new play while the daemon
+>   runs, looks like the same play and is not counted.
 >
 > The package and binary are `ro-listenbrainz-mpd`, so installing upstream never replaces it; config
 > and submission cache stay in upstream's `listenbrainz-mpd` directories. Versions are upstream's plus
